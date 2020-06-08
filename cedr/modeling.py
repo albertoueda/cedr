@@ -192,3 +192,187 @@ class CustomBertModel(pytorch_pretrained_bert.BertModel):
         encoded_layers = self.encoder(embedding_output, extended_attention_mask, output_all_encoded_layers=True)
 
         return [embedding_output] + encoded_layers
+
+from transformers import *
+
+class SciBertRanker(BertRanker):  #torch.nn.Module
+    def __init__(self):
+        super().__init__()
+
+        self.BERT_MODEL = "/users/tr.aueda/models/scibert_scivocab_uncased_allen/weights.tar.gz"
+        self.CHANNELS = 12 + 1 # from bert-base-uncased   #TODO
+        self.BERT_SIZE = 768 # from bert-base-uncased
+
+        self.bert = CustomBertModel.from_pretrained(self.BERT_MODEL)
+        self.tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        # tokenizer = BertTokenizer(vocab, ...) #TODO?
+
+        # self.bert = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        # self.tokenizer = pytorch_pretrained_bert.BertTokenizer.from_pretrained(self.BERT_MODEL)
+
+        self.dropout = torch.nn.Dropout(0.1)
+        self.cls = torch.nn.Linear(self.BERT_SIZE, 1)
+
+    def forward(self, query_tok, query_mask, doc_tok, doc_mask):
+        cls_reps, _, _ = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        return self.cls(self.dropout(cls_reps[-1]))
+
+class SciBertTransformerRanker(BertRanker):  #torch.nn.Module
+    def __init__(self):
+        super().__init__()     #TODO py3: only super() wouldnt be enough?
+        # super().__init__()
+
+        # https://github.com/allenai/scibert
+        # tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        # model_scibert = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        # tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_cased')
+        # model = AutoModel.from_pretrained('allenai/scibert_scivocab_cased')
+
+        # self.BERT_MODEL = 'allenai/scibert_scivocab_uncased'
+        self.CHANNELS = 12 + 1 # from bert-base-uncased   #TODO
+        self.BERT_SIZE = 768 # from bert-base-uncased
+
+        # self.bert = CustomBertModel.from_pretrained(self.BERT_MODEL)
+        # self.tokenizer = pytorch_pretrained_bert.BertTokenizer.from_pretrained(self.BERT_MODEL)
+        self.tokenizer = AutoTokenizer.from_pretrained('allenai/scibert_scivocab_uncased')
+        # self.bert = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        self.bert = AutoModel.from_pretrained('/users/tr.aueda/models/scibert_scivocab_uncased/')
+
+        self.dropout = torch.nn.Dropout(0.1)
+        self.cls = torch.nn.Linear(self.BERT_SIZE, 1)
+
+    def forward(self, query_tok, query_mask, doc_tok, doc_mask):
+        cls_reps, _, _ = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        return self.cls(self.dropout(cls_reps[-1]))
+
+    def encode_bert(self, query_tok, query_mask, doc_tok, doc_mask):
+        BATCH, QLEN = query_tok.shape
+        DIFF = 3 # = [CLS] and 2x[SEP]
+        maxlen = self.bert.config.max_position_embeddings
+        MAX_DOC_TOK_LEN = maxlen - QLEN - DIFF
+
+        doc_toks, sbcount = modeling_util.subbatch(doc_tok, MAX_DOC_TOK_LEN)
+        doc_mask, _ = modeling_util.subbatch(doc_mask, MAX_DOC_TOK_LEN)
+
+        query_toks = torch.cat([query_tok] * sbcount, dim=0)
+        query_mask = torch.cat([query_mask] * sbcount, dim=0)
+
+        CLSS = torch.full_like(query_toks[:, :1], self.tokenizer.vocab['[CLS]'])
+        SEPS = torch.full_like(query_toks[:, :1], self.tokenizer.vocab['[SEP]'])
+        ONES = torch.ones_like(query_mask[:, :1])
+        NILS = torch.zeros_like(query_mask[:, :1])
+
+        # build BERT input sequences
+        toks = torch.cat([CLSS, query_toks, SEPS, doc_toks, SEPS], dim=1)
+        mask = torch.cat([ONES, query_mask, ONES, doc_mask, ONES], dim=1)
+        segment_ids = torch.cat([NILS] * (2 + QLEN) + [ONES] * (1 + doc_toks.shape[1]), dim=1)
+        toks[toks == -1] = 0 # remove padding (will be masked anyway)
+
+        # execute BERT model
+        
+        # x = torch.tensor(train).to(torch.int64)
+        # print( "toks:", toks, type(toks))
+        # print( "segment_ids:", segment_ids, type(segment_ids))
+        # print( "mask:", mask, type(mask))
+
+        toks = torch.tensor(toks).to(torch.int64)
+        segment_ids = torch.tensor(segment_ids.long()).to(torch.int64)
+        mask = torch.tensor(mask).to(torch.int64)
+
+        # print( "toks:", toks, type(toks))
+        # print( "segment_ids:", segment_ids, type(segment_ids))
+        # print( "mask:", mask, type(mask))
+        
+        result = self.bert(toks, segment_ids, mask)#[0]
+        # result = self.bert(toks, segment_ids.long(), mask)
+
+        # extract relevant subsequences for query and doc
+        query_results = [r[:BATCH, 1:QLEN+1] for r in result]
+        doc_results = [r[:, QLEN+2:-1] for r in result]
+        doc_results = [modeling_util.un_subbatch(r, doc_tok, MAX_DOC_TOK_LEN) for r in doc_results]
+
+        # build CLS representation
+        cls_results = []
+        for layer in result:
+            cls_output = layer[:, 0]
+            cls_result = []
+            for i in range(cls_output.shape[0] // BATCH):
+                cls_result.append(cls_output[i*BATCH:(i+1)*BATCH])
+
+            print("cls_result:", type(cls_result), cls_result)
+
+            cls_result = torch.stack(cls_result, dim=2).mean(dim=2)
+            cls_results.append(cls_result)
+
+        return cls_results, query_results, doc_results
+
+
+class VanillaBertTransformerRanker(BertRanker):
+    def __init__(self):
+        super().__init__()
+        
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        # self.bert = AutoModel.from_pretrained('allenai/scibert_scivocab_uncased')
+        self.bert = AutoModel.from_pretrained('bert-base-uncased')
+
+        self.dropout = torch.nn.Dropout(0.1)
+        self.cls = torch.nn.Linear(self.BERT_SIZE, 1)
+
+    def forward(self, query_tok, query_mask, doc_tok, doc_mask):
+        cls_reps, _, _ = self.encode_bert(query_tok, query_mask, doc_tok, doc_mask)
+        return self.cls(self.dropout(cls_reps[-1]))
+        
+    def encode_bert(self, query_tok, query_mask, doc_tok, doc_mask):
+        BATCH, QLEN = query_tok.shape
+        DIFF = 3 # = [CLS] and 2x[SEP]
+        maxlen = self.bert.config.max_position_embeddings
+        MAX_DOC_TOK_LEN = maxlen - QLEN - DIFF
+
+        doc_toks, sbcount = modeling_util.subbatch(doc_tok, MAX_DOC_TOK_LEN)
+        doc_mask, _ = modeling_util.subbatch(doc_mask, MAX_DOC_TOK_LEN)
+
+        query_toks = torch.cat([query_tok] * sbcount, dim=0)
+        query_mask = torch.cat([query_mask] * sbcount, dim=0)
+
+        CLSS = torch.full_like(query_toks[:, :1], self.tokenizer.vocab['[CLS]'])
+        SEPS = torch.full_like(query_toks[:, :1], self.tokenizer.vocab['[SEP]'])
+        ONES = torch.ones_like(query_mask[:, :1])
+        NILS = torch.zeros_like(query_mask[:, :1])
+
+        # build BERT input sequences
+        toks = torch.cat([CLSS, query_toks, SEPS, doc_toks, SEPS], dim=1)
+        mask = torch.cat([ONES, query_mask, ONES, doc_mask, ONES], dim=1)
+        segment_ids = torch.cat([NILS] * (2 + QLEN) + [ONES] * (1 + doc_toks.shape[1]), dim=1)
+        toks[toks == -1] = 0 # remove padding (will be masked anyway)
+
+        # toks = torch.tensor(toks).to(torch.int64)
+        # segment_ids = torch.tensor(segment_ids.long()).to(torch.int64)
+        # mask = torch.tensor(mask).to(torch.int64)
+        result = self.bert(toks, segment_ids.long(), mask)#[0]
+        print("shape of first tensor:", result[0][0].shape)
+        print("shape of first result:", result[0].shape)
+
+        # extract relevant subsequences for query and doc
+        query_results = [r[:BATCH, 1:QLEN+1] for r in result]
+        doc_results = [r[:, QLEN+2:-1] for r in result]
+        doc_results = [modeling_util.un_subbatch(r, doc_tok, MAX_DOC_TOK_LEN) for r in doc_results]
+
+        # build CLS representation
+        cls_results = []
+        for layer in result:
+            cls_output = layer[:, 0]
+            cls_result = []
+            for i in range(cls_output.shape[0] // BATCH):
+                cls_result.append(cls_output[i*BATCH:(i+1)*BATCH])
+
+            # print("cls_result:", type(cls_result), cls_result)
+            print("shape of first cls_result before stack:", cls_result[0].shape)
+            print("shape of cls_result before stack:", len(cls_result))
+
+            cls_result = torch.stack(cls_result, dim=2).mean(dim=2)
+
+            print("shape of first cls_result after stack:", cls_result[0].shape)
+            print("shape of cls_result after stack:", len(cls_result))
+            cls_results.append(cls_result)
+
+        return cls_results, query_results, doc_results

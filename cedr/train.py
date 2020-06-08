@@ -16,7 +16,7 @@ from collections import defaultdict
 SEED = 42
 LR = 0.001
 BERT_LR = 2e-5
-MAX_EPOCH = 100
+MAX_EPOCH = 100    #TODO parameter
 BATCH_SIZE = 16
 BATCHES_PER_EPOCH = 32
 GRAD_ACC_SIZE = 2
@@ -33,7 +33,11 @@ MODEL_MAP = {
     'vanilla_bert': modeling.VanillaBertRanker,
     'cedr_pacrr': modeling.CedrPacrrRanker,
     'cedr_knrm': modeling.CedrKnrmRanker,
-    'cedr_drmm': modeling.CedrDrmmRanker
+    'cedr_drmm': modeling.CedrDrmmRanker,
+    'transformer_scibert': modeling.SciBertTransformerRanker,
+    'scibert': modeling.SciBertRanker,
+    'transformer_bert': modeling.VanillaBertTransformerRanker,
+    # 'biobert': modeling.BiobertRanker
 }
 
 
